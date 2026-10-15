@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 ###############################################################################
-#  mysql_manager.sh — Interactive MySQL Installer & Manager  (v2 — hardened)
-#  Target : Amazon Linux 2 (EL7 / yum)
+#  mysql_manager.sh — Interactive MySQL Installer & Manager  (v3 — multi-OS)
+#  Supports: Amazon Linux 2 / RHEL / CentOS 7  AND  Ubuntu / Debian
 #  Usage  : sudo bash mysql_manager.sh
 #  Log    : /var/log/mysql_manager_<timestamp>.log
 ###############################################################################
@@ -50,6 +50,77 @@ if (( EUID != 0 )); then
     err "Run with sudo:  sudo bash $0"
     exit 1
 fi
+
+###############################################################################
+#  OS DETECTION — sets globals used everywhere below
+###############################################################################
+OS_FAMILY=""       # "rhel" or "debian"
+OS_NAME=""         # human-readable e.g. "Amazon Linux 2", "Ubuntu 22.04"
+SVC_NAME=""        # systemd service: "mysqld" (RHEL) or "mysql" (Debian)
+MY_CNF=""          # primary config file path
+SOCK_DEFAULT=""    # default socket path
+ERROR_LOG=""       # where mysqld writes the temp root password
+
+detect_os() {
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        source /etc/os-release
+        local id_lower="${ID,,}"
+        case "$id_lower" in
+            amzn|rhel|centos|ol|rocky|alma|fedora)
+                OS_FAMILY="rhel"
+                OS_NAME="${NAME} ${VERSION_ID:-}"
+                ;;
+            ubuntu|debian|linuxmint|pop)
+                OS_FAMILY="debian"
+                OS_NAME="${NAME} ${VERSION_ID:-}"
+                ;;
+            *)
+                # Try to guess from the ID_LIKE field
+                local idlike="${ID_LIKE,,}"
+                if [[ "$idlike" == *"rhel"* || "$idlike" == *"centos"* || "$idlike" == *"fedora"* ]]; then
+                    OS_FAMILY="rhel"
+                    OS_NAME="${NAME} ${VERSION_ID:-}"
+                elif [[ "$idlike" == *"debian"* || "$idlike" == *"ubuntu"* ]]; then
+                    OS_FAMILY="debian"
+                    OS_NAME="${NAME} ${VERSION_ID:-}"
+                fi
+                ;;
+        esac
+    fi
+
+    # Fallback: check for package managers
+    if [[ -z "$OS_FAMILY" ]]; then
+        if command -v yum &>/dev/null || command -v dnf &>/dev/null; then
+            OS_FAMILY="rhel"
+            OS_NAME="Unknown RHEL-based"
+        elif command -v apt-get &>/dev/null; then
+            OS_FAMILY="debian"
+            OS_NAME="Unknown Debian-based"
+        fi
+    fi
+
+    if [[ -z "$OS_FAMILY" ]]; then
+        err "Unsupported operating system."
+        err "This script supports RHEL/CentOS/Amazon Linux (yum) and Ubuntu/Debian (apt-get)."
+        exit 1
+    fi
+
+    # Set OS-specific defaults
+    if [[ "$OS_FAMILY" == "rhel" ]]; then
+        SVC_NAME="mysqld"
+        MY_CNF="/etc/my.cnf"
+        SOCK_DEFAULT="/var/lib/mysql/mysql.sock"
+        ERROR_LOG="/var/log/mysqld.log"
+    else
+        SVC_NAME="mysql"
+        MY_CNF="/etc/mysql/my.cnf"
+        SOCK_DEFAULT="/var/run/mysqld/mysqld.sock"
+        ERROR_LOG="/var/log/mysql/error.log"
+    fi
+
+    ok "Detected OS: ${OS_NAME} (${OS_FAMILY})"
+}
 
 ###############################################################################
 #  HELPER FUNCTIONS
@@ -207,9 +278,49 @@ check_network() {
     return 0
 }
 
+# ── Find the primary MySQL config file on this system ─────────────────────────
+find_my_cnf() {
+    # Returns the first existing config path
+    for f in /etc/my.cnf /etc/mysql/my.cnf /etc/mysql/mysql.conf.d/mysqld.cnf; do
+        if [[ -f "$f" ]]; then
+            echo "$f"
+            return 0
+        fi
+    done
+    echo "$MY_CNF"  # fallback to OS default
+    return 0
+}
+
+###############################################################################
+#  PACKAGE MANAGER HELPERS (abstract yum vs apt-get)
+###############################################################################
+
+# Query installed packages for a pattern, return matching lines
+pkg_query() {
+    local pattern="$1"
+    if [[ "$OS_FAMILY" == "rhel" ]]; then
+        rpm -qa 2>/dev/null | grep -iE "$pattern" || true
+    else
+        dpkg -l 2>/dev/null | grep -iE "$pattern" | awk '{print $2 "-" $3}' || true
+    fi
+}
+
+# List files belonging to a package
+pkg_files() {
+    local pkg="$1"
+    if [[ "$OS_FAMILY" == "rhel" ]]; then
+        rpm -ql "$pkg" 2>/dev/null || true
+    else
+        # dpkg needs just the package name (strip version)
+        local pname
+        pname=$(echo "$pkg" | sed 's/-[0-9].*//')
+        dpkg -L "$pname" 2>/dev/null || true
+    fi
+}
+
 ###############################################################################
 #  DEEP MYSQL DETECTION
-#  Searches: PATH → RPM database → common paths → filesystem scan →
+#  Searches: PATH → package database → common paths → filesystem scan →
 #            running processes → systemd units
 ###############################################################################
 detect_installed() {
@@ -224,15 +335,12 @@ detect_installed() {
         found_bin=$(command -v mysql)
     fi
 
-    # ── 2. Check RPM database ────────────────────────────────────────────
+    # ── 2. Check package database (RPM or dpkg) ─────────────────────────
     if [[ -z "$found_bin" ]]; then
         local pkg
-        pkg=$(rpm -qa 2>/dev/null \
-              | grep -iE '^mysql-community-server|^mysql-server|^mariadb-server' \
-              | head -1 || true)
+        pkg=$(pkg_query '^mysql-community-server|^mysql-server|^mariadb-server' | head -1)
         if [[ -n "$pkg" ]]; then
-            # Find the binary from the package file list
-            found_bin=$(rpm -ql "$pkg" 2>/dev/null | grep -E '/bin/mysql$' | head -1 || true)
+            found_bin=$(pkg_files "$pkg" | grep -E '/bin/mysql$' | head -1 || true)
         fi
     fi
 
@@ -266,18 +374,15 @@ detect_installed() {
         local running
         running=$(pgrep -a mysqld 2>/dev/null | head -1 || true)
         if [[ -n "$running" ]]; then
-            # Extract the binary path from the process command
             local proc_bin
             proc_bin=$(echo "$running" | awk '{print $2}')
             if [[ -x "$proc_bin" ]]; then
-                # mysqld found; look for the client binary nearby
                 local bin_dir
                 bin_dir=$(dirname "$proc_bin")
                 if [[ -x "${bin_dir}/mysql" ]]; then
                     found_bin="${bin_dir}/mysql"
                 fi
             fi
-            # Even if we can't find the client, note the server is running
             if [[ -z "$found_bin" ]]; then
                 warn "mysqld process running ($(echo "$running" | awk '{print $2}'))"
                 warn "but mysql client binary not found alongside it."
@@ -290,7 +395,6 @@ detect_installed() {
     if systemctl list-unit-files 2>/dev/null | grep -qiE 'mysqld|mariadb|mysql\.service'; then
         svc_found="yes"
         if [[ -z "$found_bin" ]]; then
-            # Try to find the ExecStart binary from the unit file
             local exec_path
             for svc in mysqld mariadb mysql; do
                 exec_path=$(systemctl show -p ExecStart "$svc" 2>/dev/null \
@@ -318,12 +422,10 @@ detect_installed() {
         fi
     fi
 
-    # ── Fall back to RPM version string if binary didn't give one ────────
+    # ── Fall back to package version string if binary didn't give one ────
     if [[ -z "$INST_VER" ]]; then
         local pkg
-        pkg=$(rpm -qa 2>/dev/null \
-              | grep -iE '^mysql-community-server|^mysql-server|^mariadb-server' \
-              | head -1 || true)
+        pkg=$(pkg_query '^mysql-community-server|^mysql-server|^mariadb-server' | head -1)
         if [[ -n "$pkg" ]]; then
             echo "$pkg" | grep -qi mariadb && INST_TYPE="mariadb" || INST_TYPE="mysql"
             INST_VER=$(echo "$pkg" | grep -oP '\d+\.\d+\.\d+' | head -1 || true)
@@ -357,20 +459,28 @@ detect_installed() {
         echo -e "  ${BOLD}Server bin  :${NC}  ${srv_bin}"
 
         # Install method
-        local rpm_pkg
-        rpm_pkg=$(rpm -qa 2>/dev/null \
-                  | grep -iE '^mysql-community|^mysql-server|^mariadb-server' \
-                  | head -1 || true)
-        if [[ -n "$rpm_pkg" ]]; then
-            echo -e "  ${BOLD}Installed by:${NC}  RPM  (${rpm_pkg})"
+        local inst_pkg
+        inst_pkg=$(pkg_query '^mysql-community|^mysql-server|^mariadb-server' | head -1)
+        if [[ -n "$inst_pkg" ]]; then
+            if [[ "$OS_FAMILY" == "rhel" ]]; then
+                echo -e "  ${BOLD}Installed by:${NC}  RPM  (${inst_pkg})"
+            else
+                echo -e "  ${BOLD}Installed by:${NC}  DEB  (${inst_pkg})"
+            fi
         elif [[ -n "$INST_PATH" && "$INST_PATH" != *"/usr/bin/"* ]]; then
             echo -e "  ${BOLD}Installed by:${NC}  ${YELLOW}Non-standard / manual (binary at ${INST_PATH})${NC}"
         fi
 
         # Data directory
-        local datadir=""
-        datadir=$(grep -E '^\s*datadir\s*=' /etc/my.cnf 2>/dev/null \
+        local datadir="" cnf_file
+        cnf_file=$(find_my_cnf)
+        datadir=$(grep -E '^\s*datadir\s*=' "$cnf_file" 2>/dev/null \
                   | head -1 | sed 's/.*=\s*//' | xargs 2>/dev/null || true)
+        # Also check mysqld.cnf on Debian
+        if [[ -z "$datadir" && -f /etc/mysql/mysql.conf.d/mysqld.cnf ]]; then
+            datadir=$(grep -E '^\s*datadir\s*=' /etc/mysql/mysql.conf.d/mysqld.cnf 2>/dev/null \
+                      | head -1 | sed 's/.*=\s*//' | xargs 2>/dev/null || true)
+        fi
         [[ -z "$datadir" ]] && datadir="/var/lib/mysql"
         if [[ -d "$datadir" ]]; then
             local data_sz
@@ -379,28 +489,29 @@ detect_installed() {
         fi
 
         # Config file
-        if [[ -f /etc/my.cnf ]]; then
-            echo -e "  ${BOLD}Config file :${NC}  /etc/my.cnf"
-        elif [[ -f /etc/mysql/my.cnf ]]; then
-            echo -e "  ${BOLD}Config file :${NC}  /etc/mysql/my.cnf"
-        fi
-
-        # Service status, PID, port, socket, uptime
-        local svc_name=""
-        for s in mysqld mariadb mysql; do
-            if systemctl is-enabled "$s" &>/dev/null; then
-                svc_name="$s"; break
+        for cf in /etc/my.cnf /etc/mysql/my.cnf /etc/mysql/mysql.conf.d/mysqld.cnf; do
+            if [[ -f "$cf" ]]; then
+                echo -e "  ${BOLD}Config file :${NC}  ${cf}"
+                break
             fi
         done
-        if [[ -n "$svc_name" ]]; then
+
+        # Service status, PID, port, socket, uptime
+        local svc_name_detected=""
+        for s in mysqld mysql mariadb; do
+            if systemctl is-enabled "$s" &>/dev/null; then
+                svc_name_detected="$s"; break
+            fi
+        done
+        if [[ -n "$svc_name_detected" ]]; then
             local svc_state
-            svc_state=$(systemctl is-active "$svc_name" 2>/dev/null || echo "unknown")
+            svc_state=$(systemctl is-active "$svc_name_detected" 2>/dev/null || echo "unknown")
             if [[ "$svc_state" == "active" ]]; then
-                echo -e "  ${BOLD}Service     :${NC}  ${svc_name}.service  ${GREEN}[RUNNING]${NC}"
+                echo -e "  ${BOLD}Service     :${NC}  ${svc_name_detected}.service  ${GREEN}[RUNNING]${NC}"
 
                 # PID
                 local mpid
-                mpid=$(systemctl show -p MainPID "$svc_name" 2>/dev/null \
+                mpid=$(systemctl show -p MainPID "$svc_name_detected" 2>/dev/null \
                        | cut -d= -f2 || true)
                 [[ -n "$mpid" && "$mpid" != "0" ]] && \
                 echo -e "  ${BOLD}PID         :${NC}  ${mpid}"
@@ -408,28 +519,31 @@ detect_installed() {
                 # Port
                 local port
                 port=$(ss -tlnp 2>/dev/null | grep -i mysql | grep -oP ':\K[0-9]+' | head -1 || true)
-                [[ -z "$port" ]] && port=$(grep -E '^\s*port\s*=' /etc/my.cnf 2>/dev/null \
-                                           | head -1 | grep -oP '[0-9]+' || true)
+                if [[ -z "$port" ]]; then
+                    port=$(grep -E '^\s*port\s*=' "$cnf_file" 2>/dev/null \
+                           | head -1 | grep -oP '[0-9]+' || true)
+                fi
                 [[ -n "$port" ]] && \
                 echo -e "  ${BOLD}Port        :${NC}  ${port}"
 
                 # Socket
                 local sock
-                sock=$(grep -E '^\s*socket\s*=' /etc/my.cnf 2>/dev/null \
+                sock=$(grep -E '^\s*socket\s*=' "$cnf_file" 2>/dev/null \
                        | head -1 | sed 's/.*=\s*//' | xargs 2>/dev/null || true)
                 [[ -z "$sock" && -S /var/lib/mysql/mysql.sock ]] && sock="/var/lib/mysql/mysql.sock"
+                [[ -z "$sock" && -S /var/run/mysqld/mysqld.sock ]] && sock="/var/run/mysqld/mysqld.sock"
                 [[ -z "$sock" && -S /tmp/mysql.sock ]] && sock="/tmp/mysql.sock"
                 [[ -n "$sock" ]] && \
                 echo -e "  ${BOLD}Socket      :${NC}  ${sock}"
 
                 # Uptime
                 local uptime_str
-                uptime_str=$(systemctl show -p ActiveEnterTimestamp "$svc_name" 2>/dev/null \
+                uptime_str=$(systemctl show -p ActiveEnterTimestamp "$svc_name_detected" 2>/dev/null \
                              | cut -d= -f2 || true)
                 [[ -n "$uptime_str" ]] && \
                 echo -e "  ${BOLD}Running since:${NC} ${uptime_str}"
             else
-                echo -e "  ${BOLD}Service     :${NC}  ${svc_name}.service  ${RED}[${svc_state^^}]${NC}"
+                echo -e "  ${BOLD}Service     :${NC}  ${svc_name_detected}.service  ${RED}[${svc_state^^}]${NC}"
             fi
         elif [[ -n "$svc_found" ]]; then
             echo -e "  ${BOLD}Service     :${NC}  systemd unit exists but ${YELLOW}not enabled${NC}"
@@ -495,9 +609,11 @@ offer_backup() {
     fi
 
     # Back up config files
-    if [[ -f /etc/my.cnf ]]; then
+    local cnf_file
+    cnf_file=$(find_my_cnf)
+    if [[ -f "$cnf_file" ]]; then
         local cfg_bak="/root/my.cnf.bak_$(date +%Y%m%d_%H%M%S)"
-        cp /etc/my.cnf "$cfg_bak" 2>/dev/null || true
+        cp "$cnf_file" "$cfg_bak" 2>/dev/null || true
         info "Config backed up to ${cfg_bak}"
     fi
 }
@@ -514,15 +630,30 @@ purge_all() {
     systemctl disable mariadb 2>/dev/null || true
 
     info "Removing packages..."
-    yum remove -y --setopt='*.skip_if_unavailable=1' \
-        'mysql*' 'MySQL*' 'mariadb*' 'MariaDB*' \
-        2>/dev/null || true
+    if [[ "$OS_FAMILY" == "rhel" ]]; then
+        yum remove -y --setopt='*.skip_if_unavailable=1' \
+            'mysql*' 'MySQL*' 'mariadb*' 'MariaDB*' \
+            2>/dev/null || true
+    else
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get remove -y --purge \
+            'mysql*' 'mariadb*' 'libmysql*' \
+            2>/dev/null || true
+        apt-get autoremove -y 2>/dev/null || true
+    fi
 
     info "Cleaning data, logs, configs..."
-    rm -rf /var/lib/mysql /var/log/mysqld.log /var/log/mariadb \
-           /var/run/mysqld /etc/my.cnf /etc/my.cnf.rpmsave     \
-           /etc/my.cnf.d 2>/dev/null || true
-    rm -f /etc/yum.repos.d/mysql-community*.repo 2>/dev/null || true
+    rm -rf /var/lib/mysql /var/log/mysqld.log /var/log/mysql \
+           /var/log/mariadb /var/run/mysqld \
+           /etc/my.cnf /etc/my.cnf.rpmsave /etc/my.cnf.d \
+           /etc/mysql 2>/dev/null || true
+
+    if [[ "$OS_FAMILY" == "rhel" ]]; then
+        rm -f /etc/yum.repos.d/mysql-community*.repo 2>/dev/null || true
+    else
+        rm -f /etc/apt/sources.list.d/mysql*.list 2>/dev/null || true
+        rm -f /etc/apt/sources.list.d/mysql*.sources 2>/dev/null || true
+    fi
 
     # Clean up non-standard installs if detected earlier
     if [[ -n "${INST_PATH:-}" && "$INST_PATH" != "/usr/bin/mysql" ]]; then
@@ -534,14 +665,18 @@ purge_all() {
         fi
     fi
 
-    yum clean all --setopt='*.skip_if_unavailable=1' &>/dev/null || true
+    if [[ "$OS_FAMILY" == "rhel" ]]; then
+        yum clean all --setopt='*.skip_if_unavailable=1' &>/dev/null || true
+    else
+        apt-get clean &>/dev/null || true
+    fi
     ok "All MySQL / MariaDB components removed."
 }
 
 ###############################################################################
-#  INSTALL MYSQL
+#  INSTALL MYSQL — RHEL / Amazon Linux / CentOS
 ###############################################################################
-install_mysql() {
+install_mysql_rhel() {
     local ver="$1"
     local mm
     mm=$(echo "$ver" | grep -oP '^\d+\.\d+')
@@ -584,22 +719,127 @@ install_mysql() {
         fi
     fi
 
-    info "Starting mysqld..."
-    systemctl start mysqld || { err "mysqld would not start."; return 1; }
-    systemctl enable mysqld 2>/dev/null || true
+    info "Starting ${SVC_NAME}..."
+    systemctl start "$SVC_NAME" || { err "${SVC_NAME} would not start."; return 1; }
+    systemctl enable "$SVC_NAME" 2>/dev/null || true
     ok "MySQL server installed and running."
+}
+
+###############################################################################
+#  INSTALL MYSQL — Ubuntu / Debian
+###############################################################################
+install_mysql_debian() {
+    local ver="$1"
+    local mm
+    mm=$(echo "$ver" | grep -oP '^\d+\.\d+')
+
+    export DEBIAN_FRONTEND=noninteractive
+
+    # ── Download and install MySQL APT config package ────────────────────
+    info "Adding MySQL APT repository..."
+
+    local apt_config_url="https://dev.mysql.com/get/mysql-apt-config_0.8.33-1_all.deb"
+    local apt_deb="${SECURE_TMP}/mysql-apt-config.deb"
+
+    if ! wget -q -O "$apt_deb" "$apt_config_url" 2>&1; then
+        # Try curl as fallback
+        if ! curl -fsSL -o "$apt_deb" "$apt_config_url" 2>&1; then
+            err "Could not download MySQL APT config."
+            err "Check internet connectivity."
+            return 1
+        fi
+    fi
+
+    # Pre-seed debconf to select the right MySQL version without prompts
+    local mysql_select="mysql-${mm}"
+    case "$mm" in
+        5.7) mysql_select="mysql-5.7" ;;
+        8.0) mysql_select="mysql-8.0" ;;
+        8.4) mysql_select="mysql-8.4-lts" ;;
+        *)   mysql_select="mysql-8.0" ; warn "No pre-built APT repo for ${mm}. Defaulting to 8.0." ;;
+    esac
+
+    # Pre-configure mysql-apt-config to avoid interactive prompts
+    echo "mysql-apt-config mysql-apt-config/select-server select ${mysql_select}" \
+        | debconf-set-selections 2>/dev/null || true
+    echo "mysql-apt-config mysql-apt-config/select-tools select Enabled" \
+        | debconf-set-selections 2>/dev/null || true
+
+    if ! dpkg -i "$apt_deb" 2>&1; then
+        err "Could not install MySQL APT config package."
+        return 1
+    fi
+    rm -f "$apt_deb"
+
+    # Import GPG key
+    info "Importing GPG keys..."
+    apt-key adv --keyserver keyserver.ubuntu.com --recv-keys B7B3B788A8D3785C 2>/dev/null || true
+    # Also try the new gpg method for newer Ubuntu
+    if command -v gpg &>/dev/null; then
+        wget -qO- https://repo.mysql.com/RPM-GPG-KEY-mysql-2023 \
+            | gpg --dearmor -o /usr/share/keyrings/mysql-archive-keyring.gpg 2>/dev/null || true
+    fi
+
+    info "Updating package index..."
+    apt-get update 2>&1 || warn "Some repositories may have failed to update."
+
+    # Pre-seed root password to avoid interactive prompt during install
+    # MySQL 8.0+ uses auth_socket by default, temp password comes from error log
+    echo "mysql-community-server mysql-community-server/root-pass password " \
+        | debconf-set-selections 2>/dev/null || true
+    echo "mysql-community-server mysql-community-server/re-root-pass password " \
+        | debconf-set-selections 2>/dev/null || true
+    echo "mysql-community-server mysql-server/default-auth-override select Use Strong Password Encryption (RECOMMENDED)" \
+        | debconf-set-selections 2>/dev/null || true
+
+    info "Installing mysql-community-server (this may take a minute)..."
+    if ! apt-get install -y mysql-community-server mysql-community-client 2>&1; then
+        warn "mysql-community-* failed. Trying mysql-server..."
+        if ! apt-get install -y mysql-server mysql-client 2>&1; then
+            err "MySQL installation failed."
+            return 1
+        fi
+    fi
+
+    # Ensure the run directory exists
+    mkdir -p /var/run/mysqld 2>/dev/null || true
+    chown mysql:mysql /var/run/mysqld 2>/dev/null || true
+
+    info "Starting ${SVC_NAME}..."
+    systemctl start "$SVC_NAME" || { err "${SVC_NAME} would not start."; return 1; }
+    systemctl enable "$SVC_NAME" 2>/dev/null || true
+    ok "MySQL server installed and running."
+}
+
+###############################################################################
+#  INSTALL MYSQL — unified entry point + post-install (root password, harden)
+###############################################################################
+install_mysql() {
+    local ver="$1"
+
+    # ── Call OS-specific installer ───────────────────────────────────────
+    if [[ "$OS_FAMILY" == "rhel" ]]; then
+        install_mysql_rhel "$ver" || return 1
+    else
+        install_mysql_debian "$ver" || return 1
+    fi
 
     # ── Wait for temporary password to appear in log ─────────────────────
     #    mysqld writes the temp password AFTER the process forks, so
     #    systemctl may return before it exists.  Retry up to 15 seconds.
     info "Waiting for mysqld to initialize..."
     local temp_pw="" attempt
+
+    # Check both possible log locations
     for attempt in $(seq 1 15); do
-        temp_pw=$(grep 'temporary password' /var/log/mysqld.log 2>/dev/null \
-                  | tail -1 | awk '{print $NF}' || true)
-        if [[ -n "$temp_pw" ]]; then
-            break
-        fi
+        # RHEL: /var/log/mysqld.log   Debian: /var/log/mysql/error.log
+        for log_path in "$ERROR_LOG" /var/log/mysqld.log /var/log/mysql/error.log; do
+            if [[ -f "$log_path" ]]; then
+                temp_pw=$(grep 'temporary password' "$log_path" 2>/dev/null \
+                          | tail -1 | awk '{print $NF}' || true)
+                [[ -n "$temp_pw" ]] && break 2
+            fi
+        done
         sleep 1
     done
 
@@ -632,21 +872,43 @@ EOF
         fi
         rm -f "$optfile"
     else
-        info "No temporary password (MySQL 5.7 without validate_password, or MariaDB)."
-        local new_pw
-        new_pw=$(ask_pass "Enter NEW MySQL root password")
-        local esc_npw
-        esc_npw=$(sql_escape "$new_pw")
-        # Connect with empty password (fresh install), set the new one
-        if run_sql "" -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${esc_npw}';" 2>/dev/null; then
-            ok "Root password set."
-            ROOT_PW="$new_pw"
-        elif run_sql "" -e "SET PASSWORD FOR 'root'@'localhost' = PASSWORD('${esc_npw}');" 2>/dev/null; then
-            ok "Root password set (legacy method)."
-            ROOT_PW="$new_pw"
+        # On Debian with auth_socket, root can login without a password via sudo
+        # Try connecting with empty password first
+        if run_sql "" -e "SELECT 1" &>/dev/null; then
+            info "Root access available (auth_socket or empty password)."
+            local new_pw
+            new_pw=$(ask_pass "Enter NEW MySQL root password")
+            local esc_npw
+            esc_npw=$(sql_escape "$new_pw")
+            if run_sql "" -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${esc_npw}';" 2>/dev/null; then
+                ok "Root password set."
+                ROOT_PW="$new_pw"
+            elif run_sql "" -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${esc_npw}';" 2>/dev/null; then
+                ok "Root password set."
+                ROOT_PW="$new_pw"
+            elif run_sql "" -e "SET PASSWORD FOR 'root'@'localhost' = PASSWORD('${esc_npw}');" 2>/dev/null; then
+                ok "Root password set (legacy method)."
+                ROOT_PW="$new_pw"
+            else
+                warn "Could not set root password (may already be configured)."
+                ROOT_PW=""
+            fi
         else
-            warn "Could not set root password (may already be configured)."
-            ROOT_PW=""
+            info "No temporary password found. Trying empty password..."
+            local new_pw
+            new_pw=$(ask_pass "Enter NEW MySQL root password")
+            local esc_npw
+            esc_npw=$(sql_escape "$new_pw")
+            if run_sql "" -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${esc_npw}';" 2>/dev/null; then
+                ok "Root password set."
+                ROOT_PW="$new_pw"
+            elif run_sql "" -e "SET PASSWORD FOR 'root'@'localhost' = PASSWORD('${esc_npw}');" 2>/dev/null; then
+                ok "Root password set (legacy method)."
+                ROOT_PW="$new_pw"
+            else
+                warn "Could not set root password (may already be configured)."
+                ROOT_PW=""
+            fi
         fi
     fi
 
@@ -821,7 +1083,10 @@ collect_user() {
 #  MAIN
 ###############################################################################
 main() {
-    header "MySQL Manager  —  Amazon Linux 2  (v2)"
+    # ── Detect OS first ──────────────────────────────────────────────────
+    detect_os
+
+    header "MySQL Manager  —  ${OS_NAME}  (v3)"
 
     # ── Global state ─────────────────────────────────────────────────────
     ACTION=""
@@ -935,6 +1200,8 @@ main() {
     header "Execution Plan — Please Review"
     line
 
+    echo -e "${BOLD}OS:${NC}  ${OS_NAME} (${OS_FAMILY})"
+    echo ""
     echo -e "${BOLD}Installation:${NC}"
     case "$ACTION" in
         fresh_install) echo -e "  -> Fresh install MySQL ${GREEN}${TARGET_VER}${NC}" ;;
@@ -992,7 +1259,13 @@ main() {
     # ── 3B  Backup (if purging an existing install) ──────────────────────
     if [[ "$ACTION" == "reinstall" || "$ACTION" == "upgrade" ]]; then
         # Try to offer backup if MySQL is currently running
-        if systemctl is-active --quiet mysqld 2>/dev/null; then
+        local running_svc=""
+        for s in mysqld mysql mariadb; do
+            if systemctl is-active --quiet "$s" 2>/dev/null; then
+                running_svc="$s"; break
+            fi
+        done
+        if [[ -n "$running_svc" ]]; then
             if [[ -n "${ROOT_PW:-}" ]]; then
                 offer_backup "$ROOT_PW"
             else
@@ -1018,8 +1291,23 @@ main() {
     fi
 
     # ── Verify ───────────────────────────────────────────────────────────
-    if ! systemctl is-active --quiet mysqld 2>/dev/null; then
-        systemctl start mysqld 2>/dev/null || { err "mysqld will not start."; exit 1; }
+    # Try all possible service names
+    local svc_running=false
+    for s in "$SVC_NAME" mysqld mysql mariadb; do
+        if systemctl is-active --quiet "$s" 2>/dev/null; then
+            svc_running=true; break
+        fi
+    done
+    if [[ "$svc_running" == false ]]; then
+        for s in "$SVC_NAME" mysqld mysql; do
+            if systemctl start "$s" 2>/dev/null; then
+                svc_running=true; break
+            fi
+        done
+        if [[ "$svc_running" == false ]]; then
+            err "MySQL service will not start."
+            exit 1
+        fi
     fi
     verify_root_login || exit 1
 
@@ -1126,7 +1414,11 @@ ORDER BY User;" 2>/dev/null || true
 
     echo ""
     echo -e "${BOLD}Service:${NC}"
-    systemctl status mysqld --no-pager 2>/dev/null | head -5 || true
+    # Try the OS-appropriate service name first
+    systemctl status "$SVC_NAME" --no-pager 2>/dev/null | head -5 \
+        || systemctl status mysqld --no-pager 2>/dev/null | head -5 \
+        || systemctl status mysql --no-pager 2>/dev/null | head -5 \
+        || true
 
     line
     ok "MySQL ${TARGET_VER} is ready to use."
