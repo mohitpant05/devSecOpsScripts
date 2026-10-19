@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 ###############################################################################
-#  mysql_manager.sh — Interactive MySQL Installer & Manager  (v3 — multi-OS)
-#  Supports: Amazon Linux 2 / RHEL / CentOS 7  AND  Ubuntu / Debian
+#  mysql_manager.sh — Interactive MySQL Installer & Manager  (v4 — multi-OS)
+#  Supports: Amazon Linux 2 / RHEL / CentOS 7-9  AND  Ubuntu / Debian
 #  Usage  : sudo bash mysql_manager.sh
 #  Log    : /var/log/mysql_manager_<timestamp>.log
 ###############################################################################
@@ -10,6 +10,8 @@ set -euo pipefail
 
 # ─── Log file ─────────────────────────────────────────────────────────────────
 LOG_FILE="/var/log/mysql_manager_$(date +%Y%m%d_%H%M%S).log"
+touch "$LOG_FILE"
+chmod 600 "$LOG_FILE"
 exec > >(tee -a "$LOG_FILE") 2>&1
 echo "# Log started: $(date '+%Y-%m-%d %H:%M:%S')"
 
@@ -56,10 +58,12 @@ fi
 ###############################################################################
 OS_FAMILY=""       # "rhel" or "debian"
 OS_NAME=""         # human-readable e.g. "Amazon Linux 2", "Ubuntu 22.04"
+EL_VER=""          # RHEL major version (7, 8, 9) for repo URL selection
 SVC_NAME=""        # systemd service: "mysqld" (RHEL) or "mysql" (Debian)
 MY_CNF=""          # primary config file path
 SOCK_DEFAULT=""    # default socket path
 ERROR_LOG=""       # where mysqld writes the temp root password
+PURGE_ERRORS=0     # tracks failures during purge
 
 detect_os() {
     if [[ -f /etc/os-release ]]; then
@@ -112,6 +116,26 @@ detect_os() {
         MY_CNF="/etc/my.cnf"
         SOCK_DEFAULT="/var/lib/mysql/mysql.sock"
         ERROR_LOG="/var/log/mysqld.log"
+        # Detect EL major version for repo URL selection
+        if [[ -f /etc/os-release ]]; then
+            # shellcheck disable=SC1091
+            source /etc/os-release
+            local ver_id="${VERSION_ID:-}"
+            local id_val="${ID:-}"
+            EL_VER="${ver_id%%.*}"
+            # Amazon Linux 2 (VERSION_ID=2) uses EL7-compatible repos
+            # Amazon Linux 2023 (VERSION_ID=2023) uses EL9-compatible repos
+            if [[ "${id_val,,}" == "amzn" ]]; then
+                case "$EL_VER" in
+                    2)    EL_VER="7" ;;
+                    2023) EL_VER="9" ;;
+                esac
+            fi
+        fi
+        if [[ -z "$EL_VER" && -f /etc/redhat-release ]]; then
+            EL_VER=$(grep -oP '(?<=release )\d+' /etc/redhat-release 2>/dev/null || true)
+        fi
+        [[ -z "$EL_VER" ]] && EL_VER="7"
     else
         SVC_NAME="mysql"
         MY_CNF="/etc/mysql/my.cnf"
@@ -145,9 +169,9 @@ ask_text() {
     while true; do
         echo -ne "${CYAN}$1: ${NC}" >&2
         read -r val
-        val="${val## }"; val="${val%% }"
+        val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
         if [[ -n "$val" ]]; then
-            echo "$val"
+            printf '%s\n' "$val"
             return 0
         fi
         warn "Input cannot be empty." >&2
@@ -190,7 +214,7 @@ ask_pass() {
         if [[ "$p1" != "$p2" ]]; then
             warn "Passwords do not match." >&2; continue
         fi
-        echo "$p1"
+        printf '%s\n' "$p1"
         return 0
     done
 }
@@ -230,7 +254,7 @@ sql_escape() {
     local s="$1"
     s="${s//\\/\\\\}"       # \ → \\
     s="${s//\'/\\\'}"       # ' → \'
-    echo "$s"
+    printf '%s\n' "$s"
 }
 
 # ── Run any mysql-family command with password hidden from process list ───────
@@ -252,6 +276,22 @@ EOF
 }
 run_sql()       { local pw="$1"; shift; _run_mysql_cmd mysql     "$pw" "$@"; }
 run_mysqldump() { local pw="$1"; shift; _run_mysql_cmd mysqldump "$pw" "$@"; }
+
+# Run SQL with password-bearing statements piped via stdin (not visible in ps)
+run_sql_stdin() {
+    local pw="$1" sql="$2"; shift 2
+    local optfile="${SECURE_TMP}/my_opts.cnf"
+    cat > "$optfile" <<EOF
+[client]
+user=root
+password=${pw}
+EOF
+    chmod 600 "$optfile"
+    printf '%s\n' "$sql" | mysql --defaults-extra-file="$optfile" "$@"
+    local rc=$?
+    rm -f "$optfile"
+    return $rc
+}
 
 # ── Network connectivity check ───────────────────────────────────────────────
 check_network() {
@@ -361,11 +401,13 @@ detect_installed() {
         done
     fi
 
-    # ── 4. Scan filesystem (limited depth to keep it fast) ───────────────
+    # ── 4. Scan filesystem (limited depth, skip network mounts, timeout) ─
     if [[ -z "$found_bin" ]]; then
         info "Scanning filesystem for mysql binary (this may take a moment)..."
-        found_bin=$(find / -maxdepth 6 -name "mysql" -type f -executable \
+        found_bin=$(timeout 30 find / -maxdepth 5 -name "mysql" -type f -executable \
+                    -xdev \
                     ! -path '/proc/*' ! -path '/sys/*' ! -path '/dev/*' \
+                    ! -path '/snap/*' ! -path '/run/*' \
                     2>/dev/null | head -1 || true)
     fi
 
@@ -587,24 +629,36 @@ ver_cmp() {
 offer_backup() {
     local pw="$1"
     echo ""
-    warn "All databases in /var/lib/mysql will be PERMANENTLY DELETED."
-    if ask_yn "Create a mysqldump backup first?"; then
-        local backup_dir="/root/mysql_backup_$(date +%Y%m%d_%H%M%S)"
-        mkdir -p "$backup_dir"
+    warn "All databases in the MySQL datadir will be PERMANENTLY DELETED."
+    warn "Backup is MANDATORY before purge. Skipping requires explicit opt-out."
+    echo ""
 
-        info "Dumping all databases..."
-        if run_mysqldump "$pw" --all-databases --routines --triggers --events \
-             > "${backup_dir}/all_databases.sql" 2>/dev/null; then
-            ok "Backup saved to ${backup_dir}/all_databases.sql"
-            local sz
-            sz=$(du -sh "${backup_dir}/all_databases.sql" | awk '{print $1}')
-            info "Backup size: ${sz}"
-        else
-            err "mysqldump failed — password may be wrong or MySQL not running."
-            err "Backup file may be empty or incomplete."
-            if ! ask_yn "Continue WITHOUT a working backup?"; then
+    local backup_dir="/root/mysql_backup_$(date +%Y%m%d_%H%M%S)"
+    mkdir -p "$backup_dir"
+
+    info "Dumping all databases..."
+    local dump_file="${backup_dir}/all_databases.sql"
+    if run_mysqldump "$pw" --all-databases --routines --triggers --events \
+         > "$dump_file" 2>/dev/null; then
+        local sz
+        sz=$(stat -c%s "$dump_file" 2>/dev/null || stat -f%z "$dump_file" 2>/dev/null || echo "0")
+        if (( sz < 1024 )); then
+            err "Backup file is suspiciously small (${sz} bytes)."
+            err "Dump may be empty or incomplete — do NOT trust it."
+            if ! ask_yn "Continue WITHOUT a verified backup? DATA WILL BE LOST"; then
                 warn "Aborted."; exit 0
             fi
+        else
+            local human_sz
+            human_sz=$(du -sh "$dump_file" | awk '{print $1}')
+            ok "Backup saved to ${dump_file} (${human_sz})"
+            info "Verify this backup is restorable before relying on it."
+        fi
+    else
+        err "mysqldump failed — password may be wrong or MySQL not running."
+        rm -f "$dump_file"
+        if ! ask_yn "Continue WITHOUT any backup? ALL DATA WILL BE PERMANENTLY LOST"; then
+            warn "Aborted."; exit 0
         fi
     fi
 
@@ -612,41 +666,155 @@ offer_backup() {
     local cnf_file
     cnf_file=$(find_my_cnf)
     if [[ -f "$cnf_file" ]]; then
-        local cfg_bak="/root/my.cnf.bak_$(date +%Y%m%d_%H%M%S)"
+        local cfg_bak="${backup_dir}/my.cnf.bak"
         cp "$cnf_file" "$cfg_bak" 2>/dev/null || true
         info "Config backed up to ${cfg_bak}"
     fi
+    # Back up additional configs
+    for extra_cnf in /etc/mysql/mysql.conf.d/mysqld.cnf /etc/my.cnf.d/*.cnf; do
+        if [[ -f "$extra_cnf" ]]; then
+            local base
+            base=$(basename "$extra_cnf")
+            cp "$extra_cnf" "${backup_dir}/${base}.bak" 2>/dev/null || true
+        fi
+    done
+    info "All config files backed up to ${backup_dir}/"
 }
 
 ###############################################################################
 #  PURGE EVERYTHING MYSQL / MARIADB
 ###############################################################################
 purge_all() {
-    info "Stopping services..."
-    systemctl stop mysqld  2>/dev/null || true
-    systemctl stop mariadb 2>/dev/null || true
-    systemctl stop mysql   2>/dev/null || true
-    systemctl disable mysqld  2>/dev/null || true
-    systemctl disable mariadb 2>/dev/null || true
+    PURGE_ERRORS=0
 
-    info "Removing packages..."
+    # Discover actual datadir BEFORE removing packages (Debian --purge deletes configs)
+    local actual_datadir="/var/lib/mysql"
+    local cnf_file
+    cnf_file=$(find_my_cnf)
+    local cfg_datadir=""
+    cfg_datadir=$(grep -E '^\s*datadir\s*=' "$cnf_file" 2>/dev/null \
+                  | head -1 | sed 's/.*=\s*//' | xargs 2>/dev/null || true)
+    if [[ -z "$cfg_datadir" && -f /etc/mysql/mysql.conf.d/mysqld.cnf ]]; then
+        cfg_datadir=$(grep -E '^\s*datadir\s*=' /etc/mysql/mysql.conf.d/mysqld.cnf 2>/dev/null \
+                      | head -1 | sed 's/.*=\s*//' | xargs 2>/dev/null || true)
+    fi
+    # Also try querying running server directly
+    if [[ -z "$cfg_datadir" ]]; then
+        for svc in mysqld mysql mariadb; do
+            if systemctl is-active --quiet "$svc" 2>/dev/null; then
+                cfg_datadir=$(mysql -BNe "SELECT @@datadir;" 2>/dev/null || true)
+                cfg_datadir="${cfg_datadir%/}"
+                break
+            fi
+        done
+    fi
+    [[ -n "$cfg_datadir" ]] && actual_datadir="$cfg_datadir"
+    info "Discovered datadir: ${actual_datadir}"
+
+    info "Stopping services..."
+    for svc in mysqld mariadb mysql; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            if ! systemctl stop "$svc" 2>/dev/null; then
+                err "Failed to stop ${svc}.service"
+                PURGE_ERRORS=$(( PURGE_ERRORS + 1 ))
+            fi
+        fi
+        systemctl disable "$svc" 2>/dev/null || true
+    done
+
+    # Verify no mysqld process remains
+    if pgrep -x mysqld &>/dev/null; then
+        warn "mysqld still running after service stop. Waiting 5s..."
+        sleep 5
+        if pgrep -x mysqld &>/dev/null; then
+            err "mysqld process still alive. Cannot safely continue purge."
+            err "Kill it manually (kill \$(pgrep mysqld)) or investigate why it won't stop."
+            PURGE_ERRORS=$(( PURGE_ERRORS + 1 ))
+            return 1
+        fi
+    fi
+
+    # Build explicit package list instead of wildcards
+    info "Building package inventory..."
+    local pkgs_to_remove=()
+
     if [[ "$OS_FAMILY" == "rhel" ]]; then
-        yum remove -y --setopt='*.skip_if_unavailable=1' \
-            'mysql*' 'MySQL*' 'mariadb*' 'MariaDB*' \
-            2>/dev/null || true
+        local rhel_patterns=(
+            mysql-community-server mysql-community-client
+            mysql-community-common mysql-community-libs
+            mysql-community-libs-compat mysql-community-devel
+            mysql-community-embedded mysql-community-test
+            mysql-community-release
+            mysql-server mysql-client mysql-common mysql-libs
+            mariadb-server mariadb-client mariadb-common mariadb-libs
+            mariadb mariadb-devel
+        )
+        for pkg in "${rhel_patterns[@]}"; do
+            if rpm -q "$pkg" &>/dev/null; then
+                pkgs_to_remove+=("$pkg")
+            fi
+        done
     else
         export DEBIAN_FRONTEND=noninteractive
-        apt-get remove -y --purge \
-            'mysql*' 'mariadb*' 'libmysql*' \
-            2>/dev/null || true
-        apt-get autoremove -y 2>/dev/null || true
+        local deb_patterns=(
+            mysql-community-server mysql-community-client
+            mysql-community-common mysql-common
+            mysql-client mysql-server
+            mysql-client-core-5.7 mysql-server-core-5.7
+            mysql-client-5.7 mysql-server-5.7
+            mysql-client-core-8.0 mysql-server-core-8.0
+            mysql-client-8.0 mysql-server-8.0
+            mysql-client-core-8.4 mysql-server-core-8.4
+            mysql-client-8.4 mysql-server-8.4
+            mariadb-server mariadb-client mariadb-common
+            mysql-apt-config
+        )
+        for pkg in "${deb_patterns[@]}"; do
+            if dpkg -l "$pkg" 2>/dev/null | grep -q '^ii'; then
+                pkgs_to_remove+=("$pkg")
+            fi
+        done
+    fi
+
+    if (( ${#pkgs_to_remove[@]} > 0 )); then
+        info "Removing packages: ${pkgs_to_remove[*]}"
+        if [[ "$OS_FAMILY" == "rhel" ]]; then
+            if ! yum remove -y "${pkgs_to_remove[@]}" 2>&1; then
+                err "Package removal had errors."
+                PURGE_ERRORS=$(( PURGE_ERRORS + 1 ))
+            fi
+        else
+            if ! apt-get remove -y --purge "${pkgs_to_remove[@]}" 2>&1; then
+                err "Package removal had errors."
+                PURGE_ERRORS=$(( PURGE_ERRORS + 1 ))
+            fi
+            apt-get autoremove -y 2>/dev/null || true
+        fi
+    else
+        info "No known MySQL/MariaDB packages found to remove."
     fi
 
     info "Cleaning data, logs, configs..."
-    rm -rf /var/lib/mysql /var/log/mysqld.log /var/log/mysql \
-           /var/log/mariadb /var/run/mysqld \
-           /etc/my.cnf /etc/my.cnf.rpmsave /etc/my.cnf.d \
-           /etc/mysql 2>/dev/null || true
+    local dirs_to_remove=(
+        "$actual_datadir"
+        /var/log/mysqld.log /var/log/mysql
+        /var/log/mariadb /var/run/mysqld
+        /etc/my.cnf /etc/my.cnf.rpmsave /etc/my.cnf.d
+        /etc/mysql
+    )
+    # Add default datadir if different from configured one
+    if [[ "$actual_datadir" != "/var/lib/mysql" && -d /var/lib/mysql ]]; then
+        dirs_to_remove+=(/var/lib/mysql)
+    fi
+
+    for target in "${dirs_to_remove[@]}"; do
+        if [[ -e "$target" ]]; then
+            if ! rm -rf "$target" 2>/dev/null; then
+                err "Failed to remove: ${target}"
+                PURGE_ERRORS=$(( PURGE_ERRORS + 1 ))
+            fi
+        fi
+    done
 
     if [[ "$OS_FAMILY" == "rhel" ]]; then
         rm -f /etc/yum.repos.d/mysql-community*.repo 2>/dev/null || true
@@ -659,9 +827,14 @@ purge_all() {
     if [[ -n "${INST_PATH:-}" && "$INST_PATH" != "/usr/bin/mysql" ]]; then
         local inst_dir
         inst_dir=$(dirname "$(dirname "$INST_PATH")")
-        if [[ "$inst_dir" != "/" && "$inst_dir" != "/usr" ]]; then
-            info "Removing non-standard install at ${inst_dir}..."
-            rm -rf "$inst_dir" 2>/dev/null || true
+        if [[ "$inst_dir" != "/" && "$inst_dir" != "/usr" && "$inst_dir" != "/usr/local" ]]; then
+            warn "Non-standard install detected at ${inst_dir}"
+            if ask_yn "Remove ${inst_dir}?"; then
+                if ! rm -rf "$inst_dir" 2>/dev/null; then
+                    err "Failed to remove ${inst_dir}"
+                    PURGE_ERRORS=$(( PURGE_ERRORS + 1 ))
+                fi
+            fi
         fi
     fi
 
@@ -670,7 +843,12 @@ purge_all() {
     else
         apt-get clean &>/dev/null || true
     fi
-    ok "All MySQL / MariaDB components removed."
+
+    if (( PURGE_ERRORS > 0 )); then
+        warn "Purge completed with ${PURGE_ERRORS} error(s). Review log for details."
+    else
+        ok "All MySQL / MariaDB components removed."
+    fi
 }
 
 ###############################################################################
@@ -681,42 +859,59 @@ install_mysql_rhel() {
     local mm
     mm=$(echo "$ver" | grep -oP '^\d+\.\d+')
 
-    # ── Repo URL mapping ─────────────────────────────────────────────────
-    local repo_url=""
-    case "$mm" in
-        5.7) repo_url="https://dev.mysql.com/get/mysql57-community-release-el7-11.noarch.rpm" ;;
-        8.0) repo_url="https://dev.mysql.com/get/mysql80-community-release-el7-11.noarch.rpm" ;;
-        8.4) repo_url="https://dev.mysql.com/get/mysql84-community-release-el7-1.noarch.rpm"  ;;
+    local el="${EL_VER:-7}"
+
+    # Validate EL version is supported by Oracle repos
+    case "$el" in
+        7|8|9) ;;
         *)
-            warn "No pre-built Oracle repo for ${mm}. Falling back to 8.0 repo."
-            repo_url="https://dev.mysql.com/get/mysql80-community-release-el7-11.noarch.rpm"
+            err "EL${el} not supported by Oracle MySQL repos. Supported: EL7, EL8, EL9."
+            return 1
             ;;
     esac
 
-    info "Adding MySQL Community repo..."
+    # ── Repo URL mapping (EL-version-specific) ───────────────────────────
+    local repo_url=""
+    case "$mm" in
+        5.7)
+            if (( el > 7 )); then
+                err "MySQL 5.7 repos only available for EL7. Detected EL${el}."
+                return 1
+            fi
+            repo_url="https://dev.mysql.com/get/mysql57-community-release-el${el}-11.noarch.rpm"
+            ;;
+        8.0) repo_url="https://dev.mysql.com/get/mysql80-community-release-el${el}-11.noarch.rpm" ;;
+        8.4) repo_url="https://dev.mysql.com/get/mysql84-community-release-el${el}-1.noarch.rpm"  ;;
+        *)
+            err "No Oracle MySQL repo for version ${mm}. Supported: 5.7, 8.0, 8.4."
+            err "Refusing to silently fall back to a different version."
+            return 1
+            ;;
+    esac
+
+    info "Adding MySQL Community repo for EL${el}..."
     yum remove -y --setopt='*.skip_if_unavailable=1' 'mysql*-community-release' 2>/dev/null || true
     if ! rpm -Uvh "$repo_url" 2>&1; then
         err "Could not add MySQL repo."
-        err "Check internet connectivity or the repo URL."
+        err "Check internet connectivity or the repo URL: ${repo_url}"
         return 1
     fi
 
-    # Import GPG keys
     info "Importing GPG keys..."
-    rpm --import https://repo.mysql.com/RPM-GPG-KEY-mysql-2023 2>/dev/null || true
+    local gpg_ok=true
+    rpm --import https://repo.mysql.com/RPM-GPG-KEY-mysql-2023 2>/dev/null || gpg_ok=false
     rpm --import https://repo.mysql.com/RPM-GPG-KEY-mysql-2022 2>/dev/null || true
     rpm --import https://repo.mysql.com/RPM-GPG-KEY-mysql      2>/dev/null || true
+    if [[ "$gpg_ok" == false ]]; then
+        warn "Primary GPG key import failed — install may fail signature checks."
+    fi
 
-    # Disable broken third-party repos (e.g. dead IUS) so they don't block yum
     info "Installing mysql-community-server (this may take a minute)..."
     if ! yum install -y --setopt='*.skip_if_unavailable=1' \
             mysql-community-server mysql-community-client 2>&1; then
-        warn "GPG check may have failed. Retrying with --nogpgcheck..."
-        if ! yum install -y --nogpgcheck --setopt='*.skip_if_unavailable=1' \
-                mysql-community-server mysql-community-client 2>&1; then
-            err "MySQL installation failed."
-            return 1
-        fi
+        err "MySQL installation failed. Check GPG key and repository configuration."
+        err "Do NOT bypass with --nogpgcheck — diagnose the key/repo error instead."
+        return 1
     fi
 
     info "Starting ${SVC_NAME}..."
@@ -756,7 +951,11 @@ install_mysql_debian() {
         5.7) mysql_select="mysql-5.7" ;;
         8.0) mysql_select="mysql-8.0" ;;
         8.4) mysql_select="mysql-8.4-lts" ;;
-        *)   mysql_select="mysql-8.0" ; warn "No pre-built APT repo for ${mm}. Defaulting to 8.0." ;;
+        *)
+            err "No Oracle MySQL APT repo for version ${mm}. Supported: 5.7, 8.0, 8.4."
+            err "Refusing to silently fall back to a different version."
+            return 1
+            ;;
     esac
 
     # Pre-configure mysql-apt-config to avoid interactive prompts
@@ -771,13 +970,17 @@ install_mysql_debian() {
     fi
     rm -f "$apt_deb"
 
-    # Import GPG key
+    # Import GPG key (modern signed-by method for Ubuntu 22.04+, legacy fallback)
     info "Importing GPG keys..."
-    apt-key adv --keyserver keyserver.ubuntu.com --recv-keys B7B3B788A8D3785C 2>/dev/null || true
-    # Also try the new gpg method for newer Ubuntu
+    local gpg_imported=false
     if command -v gpg &>/dev/null; then
-        wget -qO- https://repo.mysql.com/RPM-GPG-KEY-mysql-2023 \
-            | gpg --dearmor -o /usr/share/keyrings/mysql-archive-keyring.gpg 2>/dev/null || true
+        if wget -qO- https://repo.mysql.com/RPM-GPG-KEY-mysql-2023 \
+            | gpg --dearmor -o /usr/share/keyrings/mysql-archive-keyring.gpg 2>/dev/null; then
+            gpg_imported=true
+        fi
+    fi
+    if [[ "$gpg_imported" == false ]]; then
+        apt-key adv --keyserver keyserver.ubuntu.com --recv-keys B7B3B788A8D3785C 2>/dev/null || true
     fi
 
     info "Updating package index..."
@@ -861,8 +1064,8 @@ password=${temp_pw}
 EOF
         chmod 600 "$optfile"
 
-        if mysql --defaults-extra-file="$optfile" --connect-expired-password \
-             -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${esc_pw}';" 2>/dev/null; then
+        if printf '%s\n' "ALTER USER 'root'@'localhost' IDENTIFIED BY '${esc_pw}';" \
+             | mysql --defaults-extra-file="$optfile" --connect-expired-password 2>/dev/null; then
             ok "Root password set."
             ROOT_PW="$new_pw"
         else
@@ -880,13 +1083,13 @@ EOF
             new_pw=$(ask_pass "Enter NEW MySQL root password")
             local esc_npw
             esc_npw=$(sql_escape "$new_pw")
-            if run_sql "" -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${esc_npw}';" 2>/dev/null; then
+            if run_sql_stdin "" "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${esc_npw}';" 2>/dev/null; then
                 ok "Root password set."
                 ROOT_PW="$new_pw"
-            elif run_sql "" -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${esc_npw}';" 2>/dev/null; then
+            elif run_sql_stdin "" "ALTER USER 'root'@'localhost' IDENTIFIED BY '${esc_npw}';" 2>/dev/null; then
                 ok "Root password set."
                 ROOT_PW="$new_pw"
-            elif run_sql "" -e "SET PASSWORD FOR 'root'@'localhost' = PASSWORD('${esc_npw}');" 2>/dev/null; then
+            elif run_sql_stdin "" "SET PASSWORD FOR 'root'@'localhost' = PASSWORD('${esc_npw}');" 2>/dev/null; then
                 ok "Root password set (legacy method)."
                 ROOT_PW="$new_pw"
             else
@@ -899,10 +1102,10 @@ EOF
             new_pw=$(ask_pass "Enter NEW MySQL root password")
             local esc_npw
             esc_npw=$(sql_escape "$new_pw")
-            if run_sql "" -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '${esc_npw}';" 2>/dev/null; then
+            if run_sql_stdin "" "ALTER USER 'root'@'localhost' IDENTIFIED BY '${esc_npw}';" 2>/dev/null; then
                 ok "Root password set."
                 ROOT_PW="$new_pw"
-            elif run_sql "" -e "SET PASSWORD FOR 'root'@'localhost' = PASSWORD('${esc_npw}');" 2>/dev/null; then
+            elif run_sql_stdin "" "SET PASSWORD FOR 'root'@'localhost' = PASSWORD('${esc_npw}');" 2>/dev/null; then
                 ok "Root password set (legacy method)."
                 ROOT_PW="$new_pw"
             else
@@ -912,16 +1115,39 @@ EOF
         fi
     fi
 
+    # ── Verify installed version matches requested ─────────────────────
+    if [[ -n "${ROOT_PW}" ]]; then
+        local installed_ver
+        installed_ver=$(run_sql "$ROOT_PW" -BNe "SELECT VERSION();" 2>/dev/null || true)
+        if [[ -n "$installed_ver" ]]; then
+            local installed_mm
+            installed_mm=$(echo "$installed_ver" | grep -oP '^\d+\.\d+')
+            local requested_mm
+            requested_mm=$(echo "$ver" | grep -oP '^\d+\.\d+')
+            if [[ "$installed_mm" != "$requested_mm" ]]; then
+                err "Version mismatch: requested ${ver} but installed ${installed_ver}."
+                err "Repository may not have the requested version."
+                warn "Investigate before creating databases or users."
+            else
+                ok "Installed version ${installed_ver} matches requested ${requested_mm}.x"
+            fi
+        fi
+    fi
+
     # ── Basic hardening ──────────────────────────────────────────────────
     if [[ -n "${ROOT_PW}" ]]; then
         info "Applying basic hardening..."
-        run_sql "$ROOT_PW" -e "
+        if run_sql "$ROOT_PW" -e "
 DELETE FROM mysql.user WHERE User='';
 DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost','127.0.0.1','::1');
 DROP DATABASE IF EXISTS test;
 DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
 FLUSH PRIVILEGES;
-" 2>/dev/null && ok "Hardening applied." || warn "Some hardening steps skipped."
+" 2>/dev/null; then
+            ok "Hardening applied."
+        else
+            warn "Some hardening steps skipped."
+        fi
     fi
     return 0
 }
@@ -966,7 +1192,11 @@ collect_user() {
     local hc
     read -rp "$(echo -e "${YELLOW}Choose [1/2/3]: ${NC}")" hc
     case "$hc" in
-        2) uhost="%" ;;
+        2)
+            uhost="%"
+            warn "'%' allows connections from ANY host. Use only if explicitly required."
+            warn "Prefer a specific IP/subnet for production databases."
+            ;;
         3)
             while true; do
                 uhost=$(ask_text "Host / IP")
@@ -999,7 +1229,17 @@ collect_user() {
         4) upriv="ALL PRIVILEGES"; ugrant="WITH GRANT OPTION" ;;
         5) upriv="SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, INDEX, ALTER" ;;
         6) upriv="SELECT, LOCK TABLES, SHOW VIEW, EVENT, TRIGGER" ;;
-        7) upriv=$(ask_text "Privileges (comma-separated, e.g. SELECT, INSERT)") ;;
+        7)
+            while true; do
+                upriv=$(ask_text "Privileges (comma-separated, e.g. SELECT, INSERT)")
+                local bad_chars='[;`"'"'"'\\]'
+                if [[ "$upriv" =~ $bad_chars ]]; then
+                    err "Privilege string must not contain ; ' \" \` or \\"
+                    continue
+                fi
+                break
+            done
+            ;;
         *) upriv="SELECT"; warn "Defaulted to SELECT." ;;
     esac
 
@@ -1086,7 +1326,7 @@ main() {
     # ── Detect OS first ──────────────────────────────────────────────────
     detect_os
 
-    header "MySQL Manager  —  ${OS_NAME}  (v3)"
+    header "MySQL Manager  —  ${OS_NAME}  (v4)"
 
     # ── Global state ─────────────────────────────────────────────────────
     ACTION=""
@@ -1126,6 +1366,8 @@ main() {
                 warn "Same version (${INST_VER}) already installed."
                 if ask_yn "Delete everything and REINSTALL MySQL ${TARGET_VER}?"; then
                     ACTION="reinstall"
+                    info "Current root password needed for pre-purge backup."
+                    ROOT_PW=$(ask_pass "Current MySQL root password")
                 else
                     info "Keeping existing installation."
                     ACTION="skip"
@@ -1136,6 +1378,8 @@ main() {
                 warn "Installed (${INST_VER}) is NEWER than requested (${TARGET_VER})."
                 if ask_yn "DOWNGRADE? All data will be lost"; then
                     ACTION="reinstall"
+                    info "Current root password needed for pre-purge backup."
+                    ROOT_PW=$(ask_pass "Current MySQL root password")
                 else
                     ACTION="skip"
                     ROOT_PW=$(ask_pass "Current MySQL root password")
@@ -1145,6 +1389,8 @@ main() {
                 warn "Installed (${INST_VER}) is OLDER than requested (${TARGET_VER})."
                 if ask_yn "Remove old version and install ${TARGET_VER}? ALL DATA WILL BE LOST"; then
                     ACTION="upgrade"
+                    info "Current root password needed for pre-purge backup."
+                    ROOT_PW=$(ask_pass "Current MySQL root password")
                 else
                     ACTION="skip"
                     ROOT_PW=$(ask_pass "Current MySQL root password")
@@ -1155,6 +1401,8 @@ main() {
         warn "MySQL/MariaDB detected but version unknown."
         if ask_yn "Remove it and install MySQL ${TARGET_VER}?"; then
             ACTION="reinstall"
+            info "Current root password needed for pre-purge backup."
+            ROOT_PW=$(ask_pass "Current MySQL root password")
         else
             ACTION="skip"
             ROOT_PW=$(ask_pass "Current MySQL root password")
@@ -1239,6 +1487,18 @@ main() {
     if [[ "$ACTION" == "reinstall" || "$ACTION" == "upgrade" ]]; then
         echo -e "  ${RED}${BOLD}!! WARNING: ALL EXISTING MYSQL DATA WILL BE PERMANENTLY DELETED${NC}"
         echo ""
+        local confirm_host
+        confirm_host=$(hostname)
+        echo -e "  ${RED}Type '${confirm_host}' to confirm destructive operation:${NC}"
+        local typed_confirm
+        read -rp "  > " typed_confirm
+        if [[ "$typed_confirm" != "$confirm_host" ]]; then
+            err "Confirmation mismatch. Expected '${confirm_host}', got '${typed_confirm}'."
+            warn "Aborted. No changes were made."
+            exit 0
+        fi
+        ok "Destructive operation confirmed."
+        echo ""
     fi
 
     if ! ask_yn "Proceed with this plan?"; then
@@ -1251,14 +1511,25 @@ main() {
     ###################################################################
     header "Executing..."
 
-    # ── 3A  Network check (only if we need to download) ──────────────────
+    # ── 3A  Pre-flight checks (network + disk space) ──────────────────
     if [[ "$ACTION" != "skip" ]]; then
         check_network || exit 1
+
+        local avail_mb
+        avail_mb=$(df -m /var/lib 2>/dev/null | awk 'NR==2{print $4}' || echo "0")
+        if (( avail_mb < 500 )); then
+            err "Insufficient disk space on /var/lib: ${avail_mb}MB available, need >= 500MB."
+            err "MySQL install + datadir initialization requires significant disk space."
+            if ! ask_yn "Continue anyway? Install may fail mid-way"; then
+                exit 1
+            fi
+        elif (( avail_mb < 1000 )); then
+            warn "Low disk space on /var/lib: ${avail_mb}MB. Recommend >= 1GB free."
+        fi
     fi
 
-    # ── 3B  Backup (if purging an existing install) ──────────────────────
+    # ── 3B  Backup (mandatory when purging an existing install) ─────────
     if [[ "$ACTION" == "reinstall" || "$ACTION" == "upgrade" ]]; then
-        # Try to offer backup if MySQL is currently running
         local running_svc=""
         for s in mysqld mysql mariadb; do
             if systemctl is-active --quiet "$s" 2>/dev/null; then
@@ -1269,9 +1540,30 @@ main() {
             if [[ -n "${ROOT_PW:-}" ]]; then
                 offer_backup "$ROOT_PW"
             else
-                warn "No root password available — skipping backup offer."
-                warn "If you need a backup, Ctrl-C now and do it manually."
-                sleep 3
+                err "MySQL is running but no root password available."
+                err "Cannot create backup without authentication."
+                if ! ask_yn "Continue WITHOUT any backup? ALL DATA WILL BE PERMANENTLY LOST"; then
+                    warn "Aborted. Provide root password or back up manually."
+                    exit 0
+                fi
+            fi
+        else
+            warn "MySQL service not running — cannot create SQL dump."
+            # Check all possible data directories for existing data
+            local check_datadir="/var/lib/mysql"
+            local cnf_chk
+            cnf_chk=$(find_my_cnf)
+            local cnf_datadir=""
+            cnf_datadir=$(grep -E '^\s*datadir\s*=' "$cnf_chk" 2>/dev/null \
+                          | head -1 | sed 's/.*=\s*//' | xargs 2>/dev/null || true)
+            [[ -n "$cnf_datadir" ]] && check_datadir="$cnf_datadir"
+
+            if [[ -d "$check_datadir" ]] && (( $(du -sm "$check_datadir" 2>/dev/null | awk '{print $1}' || echo 0) > 10 )); then
+                warn "Data directory ${check_datadir} contains data."
+                if ! ask_yn "Continue without backup? Data directory will be deleted"; then
+                    warn "Aborted. Start MySQL and provide root password to back up."
+                    exit 0
+                fi
             fi
         fi
     fi
@@ -1279,7 +1571,14 @@ main() {
     # ── 3C  Purge ────────────────────────────────────────────────────────
     if [[ "$ACTION" == "reinstall" || "$ACTION" == "upgrade" || "$ACTION" == "fresh_install" ]]; then
         info "[1/4] Cleaning previous MySQL / MariaDB remnants..."
-        purge_all
+        purge_all || { err "Purge failed critically. Cannot continue."; exit 1; }
+        if (( PURGE_ERRORS > 0 )); then
+            warn "Purge had ${PURGE_ERRORS} non-fatal error(s)."
+            if ! ask_yn "Continue with installation despite purge errors?"; then
+                warn "Aborted. Review log: ${LOG_FILE}"
+                exit 0
+            fi
+        fi
     fi
 
     # ── 3D  Install ──────────────────────────────────────────────────────
@@ -1354,12 +1653,12 @@ main() {
             local esc_p
             esc_p=$(sql_escape "$_p")
 
-            # Create user
-            if run_sql "$ROOT_PW" -e \
+            # Create user (password piped via stdin, not visible in ps)
+            if run_sql_stdin "$ROOT_PW" \
                 "CREATE USER IF NOT EXISTS '${_n}'@'${_h}' IDENTIFIED BY '${esc_p}';" 2>/dev/null; then
                 ok "User '${_n}'@'${_h}' created."
             else
-                if run_sql "$ROOT_PW" -e \
+                if run_sql_stdin "$ROOT_PW" \
                     "ALTER USER '${_n}'@'${_h}' IDENTIFIED BY '${esc_p}';" 2>/dev/null; then
                     ok "User '${_n}'@'${_h}' existed -> password updated."
                 else
